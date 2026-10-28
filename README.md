@@ -15,9 +15,17 @@ export FDG_HOST=YOUR_METER_IP
 python3 fdg_tool.py
 ```
 
-Version **1.1.0** adds a colored dashboard with measurement cards, a live flow
-trend, and a settings editor with unit-aware decimal examples. Colors and Unicode
+Version **1.1.1** shows all settings in a single list with numbered choice legends.
+It includes a colored dashboard with measurement cards, a live flow trend, and
+a settings editor with unit-aware decimal examples. Colors and Unicode
 borders turn on automatically in a compatible SSH terminal. No packages are required.
+
+The dashboard refreshes as a complete frame and checks the current terminal size
+each time. It switches to a compact layout when the full view would scroll out
+of the window. The **ERRORS & WARNINGS** area lists the meter's decoded errors
+and warnings, including reverse flow, or displays **No errors** when the status
+word is zero. A failed read displays an unavailable status instead of reusing an
+old error state. Modpoll subprocesses do not share the menu's keyboard input.
 
 The menu displays current flow, raw flow, peak/bottom hold, integrated flow,
 leak flow, pressure, conversion basis, stability, output states, initialization,
@@ -32,10 +40,12 @@ error/warning names (including reverse flow), and operation statuses.
 - `q`: Exit.
 
 In **Settings & edit**, the table groups settings by flow, pipe installation,
-gas/conversion, and display units. The **INPUT FORMAT** column shows the decimal
-pattern (`0.0`, `0.00`, or `0.000`) or says to choose a code. Type a setting number,
-manual register address, or setting name. Any setting number works on any page.
-Use `n`/`p` for pages, `r` to refresh, or Enter to return to the dashboard.
+gas/conversion, and display units. All 22 editable settings appear in one list;
+use terminal scrollback if the list is taller than the window. The **ENTER / CHOICES**
+column shows the decimal pattern and unit for numbers, or the actual numbered
+choices, such as `0=m3/h, 1=L/min, 2=CFM`. Longer choices wrap without being cut off.
+Type a setting number, manual register address, or setting name.
+Use `r` to refresh or Enter to return to the dashboard.
 
 For a numeric setting, the edit form shows the current unit, allowed range,
 maximum decimal places, smallest step, and an example with its raw encoding.
@@ -103,6 +113,9 @@ python3 fdg_tool.py --host YOUR_METER_IP --modpoll /usr/local/bin/modpoll status
 
 # Terminal appearance controls (also respects the NO_COLOR environment variable)
 python3 fdg_tool.py --color never --ascii
+
+# Force the compact dashboard if preferred
+python3 fdg_tool.py --compact
 
 # Save all supported settings, or inspect the register catalog offline
 python3 fdg_tool.py snapshot
@@ -248,8 +261,11 @@ The tool has offline behavior tests for addressing, parsing, signed decoding,
 word order, the editable-register boundary, input scaling, cancellation, stale
 configuration, snapshots, failed writes, verification and logging. The interface
 tests cover editing directly from Settings, decimal examples in the current unit,
-input correction, read-only fields, pagination, model selection, terminal widths,
-color controls and cursor restoration after failed reads. Run them with:
+input correction, read-only fields, the complete settings list and numbered choices,
+model selection, terminal widths,
+color controls and cursor restoration after failed reads. Dashboard checks cover
+complete single-frame redraws, resizing, short/narrow viewports, and both clear
+and active meter error states. Run them with:
 
 ```bash
 python3 -m unittest -v

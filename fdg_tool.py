@@ -7,6 +7,7 @@ Only Modpoll sees address + 1, with -0 deliberately omitted for Modpoll 3.4.
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
 import csv
 import json
 import os
@@ -23,7 +24,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DEFAULT_HOST = os.environ.get("FDG_HOST", "127.0.0.1")
 RESOLUTION = {0: Decimal("0.001"), 1: Decimal("0.01"),
               2: Decimal("0.1"), 3: Decimal("1")}
@@ -277,7 +278,7 @@ class Modpoll:
 
     def run(self, args):
         try:
-            result = self.runner(args, capture_output=True, text=True,
+            result = self.runner(args, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                  timeout=self.timeout + 5, check=False)
         except FileNotFoundError:
             raise ToolError("Modpoll not found. Supply its path with --modpoll.")
@@ -491,7 +492,7 @@ def warning_names(mask):
     unknown = mask & ~((1 << len(WARNINGS)) - 1)
     if unknown:
         result.append("Unknown bits 0x{:04X}".format(unknown))
-    return "; ".join(result) or "None"
+    return "; ".join(result) or "No errors"
 
 
 def measurements(words, mode):
@@ -517,13 +518,13 @@ class Terminal:
               "warning": "1;33", "error": "1;31", "dim": "2;37", "normal": "0"}
 
     def __init__(self, color="auto", ascii_only=False, out=print, width=None,
-                 height=None, interactive=None):
-        size = shutil.get_terminal_size((100, 30))
-        self.width = max(24, min(width or size.columns, 120))
-        self.height = height or size.lines
+                 height=None, interactive=None, compact=False):
         self.out = out
+        self._width_override, self._height_override = width, height
+        self.compact = compact
         self.interactive = (sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
                             if interactive is None else interactive)
+        self.refresh_size()
         self.color = color == "always" or (color == "auto" and self.interactive
                                            and "NO_COLOR" not in os.environ)
         try:
@@ -541,8 +542,43 @@ class Terminal:
         self.out(self.style(text, role))
 
     def clear(self):
+        self.refresh_size()
         if self.interactive:
             self.control("\033[2J\033[H")
+
+    def refresh_size(self):
+        try:
+            # Read the actual PTY before consulting possibly stale COLUMNS/LINES.
+            size = os.get_terminal_size(sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            size = shutil.get_terminal_size((100, 30))
+        columns = self._width_override or size.columns
+        # Leave the rightmost column unused to avoid terminal auto-wrap edge cases.
+        self.width = max(12, min(columns - (1 if self.interactive else 0), 120))
+        self.height = max(6, self._height_override or size.lines)
+
+    @contextmanager
+    def frame(self, clear=True):
+        """Build the entire view in memory and deliver it in one flushed write."""
+        self.refresh_size()
+        original = self.out
+        lines = []
+        self.out = lines.append
+        try:
+            yield
+        except BaseException:
+            self.out = original
+            raise
+        else:
+            self.out = original
+            prefix = "\033[2J\033[H" if clear and self.interactive else ""
+            newline = "\r\n" if self.interactive else "\n"
+            payload = prefix + newline.join(lines) + newline
+            if original is print:
+                sys.stdout.write(payload)
+                sys.stdout.flush()
+            else:
+                original(payload.rstrip("\r\n"))
 
     def control(self, sequence):
         if self.out is print:
@@ -631,7 +667,8 @@ def input_spec(field, words, model=None, mode="resolution"):
     """One source of truth for the form's precision, units, examples and limits."""
     options = field.enum(model)
     if options is not None:
-        return {"choices": options, "format": "choose a code"}
+        return {"choices": options, "format": ", ".join(
+            "{}={}".format(code, name) for code, name in options.items())}
     if field.address == 196:
         return {"choices": None, "format": "select variant"}
     scale, unit = field.measure(words, mode)
@@ -690,8 +727,9 @@ def show_status(client, words, mode="resolution", out=print, ui=None, brief=Fals
         "Initial settings: {}  |  Outputs: 1={}  2={}".format(
             label({0: "Incomplete", 1: "Complete"}, words[0]),
             "ON" if words[15] & 1 else "OFF", "ON" if words[15] & 2 else "OFF")])
-    ui.box("METER STATUS  /  {}".format(data["error_mask"]),
-           [(data["warnings"], "warning" if words[1] else "good")], "warning" if words[1] else "good")
+    status_role = "error" if words[1] & ~0x100 else "warning" if words[1] else "good"
+    ui.box("ERRORS & WARNINGS  /  {}".format(data["error_mask"]),
+           [(data["warnings"], status_role)], status_role)
     ui.message("Raw flow: {} | {} | Steps: {} / {}{}".format(
         data["flow_raw"], "resolution-scaled" if mode == "resolution" else "integer",
         label({k: str(v) for k, v in RESOLUTION.items()}, words[25]),
@@ -706,25 +744,117 @@ def show_status(client, words, mode="resolution", out=print, ui=None, brief=Fals
         ui.message("Updated {} (UTC)".format(data["timestamp_utc"]), "dim")
 
 
-def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
-                  start=0, page_size=None, interactive=False):
-    ui = ui or Terminal(out=out)
-    end = min(len(SELECTABLE), start + (page_size or len(SELECTABLE)))
+def capture_view(ui, draw):
+    original = ui.out
     lines = []
-    # Fit a table to 60+ columns; use stacked entries on narrower terminals.
-    compact = ui.width < 60
+    ui.out = lines.append
+    try:
+        draw()
+    finally:
+        ui.out = original
+    return lines
+
+
+def dashboard_actions(ui, compact=False):
+    text = "[S] Settings/edit [W] Live [B] Snapshot [M] Size [Enter] Refresh [Q] Quit"
+    if compact:
+        ui.message(text, "accent")
+    else:
+        ui.box("ACTIONS", [(text, "accent")])
+
+
+def compact_status(client, words, mode, ui, details=True):
+    data = measurements(words, mode)
+    ui.message("FD-G / FIELD CONSOLE  v{}{}".format(VERSION, " / DEMO" if client.demo else ""), "accent")
+    ui.message("{}:{} / ID {} / {} UTC".format(client.host, client.port, client.unit_id,
+               data["timestamp_utc"][11:19]), "dim")
+    ui.message("FLOW {} {}  |  PRESSURE {} {}".format(
+        pretty_number(data["flow_display"]), data["flow_unit"], data["pressure"], data["pressure_unit"]), "accent")
+    ui.message("Stability {} ({}/4) | Initial {} | Out 1={} 2={}".format(
+        data["stability"], words[14], label({0: "Incomplete", 1: "Complete"}, words[0]),
+        "ON" if words[15] & 1 else "OFF", "ON" if words[15] & 2 else "OFF"))
+    role = "error" if words[1] & ~0x100 else "warning" if words[1] else "good"
+    ui.message("ERRORS & WARNINGS [{}]".format(data["error_mask"]), role)
+    ui.message(data["warnings"], role)
+    if details:
+        ui.message("Total {} {} | Leak {} {}".format(data["total_display"], data["total_unit"],
+            flow_value(u32(words, 12), words[25], mode), data["flow_unit"]))
+        ui.message("Basis {} / {} / {}".format(data["conversion"],
+            BY_KEY["reference_temp"].display(words), label(BY_KEY["pressure_input"].choices, words[200])))
+        ui.message("Raw flow {} | {} | Flow step {}".format(data["flow_raw"], mode,
+                   label({k: str(v) for k, v in RESOLUTION.items()}, words[25])), "dim")
+    if any(words[address] for address in (22, 23, 24)):
+        ui.message("Operations: init={} / static leak={} / origin={}".format(
+            label({0: "Idle", 1: "Executing", 2: "Finish"}, words[22]),
+            label({0: "Idle", 1: "Executing", 2: "Success"}, words[23]),
+            label({0: "Idle", 1: "Executing", 2: "Success", 3: "Failure"}, words[24])), "warning")
+
+
+def render_dashboard(client, words, mode, ui, view="menu", history=(), csv_path=None, clear=True):
+    """Render one complete viewport, shrinking optional detail before it can scroll."""
+    def footer(compact=False, details=True):
+        if view == "menu":
+            dashboard_actions(ui, compact)
+        elif view == "live":
+            if details:
+                if compact:
+                    ui.message("Trend " + sparkline(history, max(1, ui.width - 6), ui.unicode), "accent")
+                else:
+                    ui.box("FLOW TREND  /  LAST {} SAMPLES".format(len(history)), [
+                        (sparkline(history, ui.width - 4, ui.unicode), "accent")])
+            ui.message("LIVE / Ctrl+C returns.{}".format(" CSV recording." if csv_path else ""), "accent")
+
+    with ui.frame(clear=clear):
+        def full():
+            show_status(client, words, mode, ui=ui, brief=view != "status")
+            footer()
+        lines = capture_view(ui, full)
+        if ui.compact or (ui.interactive and len(lines) > ui.height - 2):
+            def small():
+                compact_status(client, words, mode, ui, details=True)
+                footer(compact=True)
+            lines = capture_view(ui, small)
+            if len(lines) > ui.height - 2:
+                def minimal():
+                    compact_status(client, words, mode, ui, details=False)
+                    footer(compact=True, details=False)
+                lines = capture_view(ui, minimal)
+        for line in lines:
+            ui.out(line)
+
+
+def render_connection_error(client, error, ui, live=False):
+    with ui.frame():
+        ui.banner(client, "CONNECTION ERROR")
+        ui.box("NO CURRENT READING", [(str(error), "error"),
+               "Meter errors/warnings are unavailable until communication recovers."], "error")
+        if live:
+            ui.message("Read-only polling will continue. Ctrl+C returns.", "accent")
+        else:
+            dashboard_actions(ui, compact=True)
+
+
+def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
+                  interactive=False):
+    ui = ui or Terminal(out=out)
+    lines = []
+    # Keep every choice visible. Wrap cells instead of clipping code-to-label mappings.
+    compact = ui.width < 72
     if not compact:
         available = ui.width - 4 - 2 - 7 - 8
-        format_width = 13 if ui.width >= 78 else 10
-        title_width = min(24, (available - format_width) // 2 + 2)
-        value_width = available - format_width - title_width
+        title_width = min(24, max(18, available * 4 // 10))
+        value_width = min(22, max(12, available // 4))
+        format_width = available - title_width - value_width
         widths = [2, 7, title_width, value_width, format_width]
-        def row(cells):
-            return "  ".join(ui.fit(cell, width) for cell, width in zip(cells, widths))
-        lines.append((row(["#", "REG", "SETTING", "CURRENT", "INPUT FORMAT"]), "dim"))
+        def rows(cells):
+            columns = [textwrap.wrap(str(cell), width=width, break_on_hyphens=False) or [""]
+                       for cell, width in zip(cells, widths)]
+            return ["  ".join((column[index] if index < len(column) else "").ljust(width)
+                              for column, width in zip(columns, widths))
+                    for index in range(max(map(len, columns)))]
+        lines.extend((row, "dim") for row in rows(["#", "REG", "SETTING", "CURRENT", "ENTER / CHOICES"]))
     previous_group = None
-    for index in range(start, end):
-        field = SELECTABLE[index]
+    for index, field in enumerate(SELECTABLE):
         group = next(name for name, keys in SETTING_GROUPS if field.key in keys)
         if group != previous_group:
             lines.append((group, "accent"))
@@ -733,24 +863,29 @@ def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
         if words is not None and field.enum(model) is not None:
             value = label(field.enum(model), field.raw_value(words))
         try:
-            form = input_spec(field, words, model, mode)["format"] if words is not None else (
-                "choose a code" if field.choices else "see editor")
+            if words is not None:
+                spec = input_spec(field, words, model, mode)
+                form = "{} {}".format(spec["format"], spec.get("unit", "")).strip()
+            else:
+                options = field.enum(model)
+                form = ", ".join("{}={}".format(code, name) for code, name in options.items()) if options else "see editor"
         except ToolError:
             form = "raw only"
         title = SHORT_TITLES.get(field.key, field.title)
         if compact:
             lines += ["{}  [{}] {}".format(index + 1, field.registers, title),
-                      "   {} | input: {}".format(value, form)]
+                      "   Current: {}".format(value),
+                      "   Enter: {}".format(form)]
         else:
-            lines.append(row([str(index + 1), field.registers, title, value, form]))
-    ui.box("SETTINGS & EDIT  /  {}-{} OF {}".format(start + 1, end, len(SELECTABLE)), lines)
+            lines.extend(rows([str(index + 1), field.registers, title, value, form]))
+    ui.box("ALL SETTINGS  /  {} EDITABLE".format(len(SELECTABLE)), lines)
     if words is not None:
         ui.message("Read-only steps: flow [25]={}, total [26]={}. Size variant: {}.".format(
             label({k: str(v) for k, v in RESOLUTION.items()}, words[25]),
             label({k: str(v) for k, v in RESOLUTION.items()}, words[26]), model or "not selected"), "dim")
     if interactive:
         ui.message("Type a setting # (1-{}), register address, or name to EDIT.".format(len(SELECTABLE)), "accent")
-        ui.message("[n] Next  [p] Previous  [r] Refresh  [m] Size variant  [Enter/b] Dashboard", "dim")
+        ui.message("[r] Refresh  [m] Size variant  [Enter/b] Dashboard  |  Scroll up for earlier rows.", "dim")
     else:
         ui.message("To edit: run the interactive tool and press S, then select a setting number.", "accent")
         ui.message("CLI: python3 fdg_tool.py --host <HOST> set <register-or-name> <value>", "dim")
@@ -802,22 +937,14 @@ def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution", ui
                 except InvalidOperation:
                     pass
                 if ui.interactive:
-                    ui.clear()
-                    show_status(client, words, mode, ui=ui, brief=True)
-                    ui.box("FLOW TREND  /  LAST {} SAMPLES".format(len(history)), [
-                        (sparkline(history, ui.width - 4, ui.unicode), "accent")])
-                    ui.message("LIVE  /  Ctrl+C returns to the dashboard.{}".format(
-                        "  CSV: " + str(csv_path) if csv_path else ""), "accent")
+                    render_dashboard(client, words, mode, ui, view="live", history=history, csv_path=csv_path)
                 else:
                     ui.line("{timestamp_utc}  Flow {flow_display} {flow_unit}  raw={flow_raw}  "
                             "P={pressure} {pressure_unit}  Stability={stability}  {warnings}".format(**data))
             except ToolError as exc:
                 data = {"timestamp_utc": stamp(), "error": str(exc)}
                 if ui.interactive:
-                    ui.clear()
-                    ui.banner(client, "CONNECTION ERROR")
-                    ui.box("NO CURRENT READING", [(str(exc), "error"),
-                           "Read-only polling will continue. Ctrl+C returns."], "error")
+                    render_connection_error(client, exc, ui, live=True)
                 else:
                     ui.line("{}  READ FAILED - no current reading: {}".format(data["timestamp_utc"], exc), "error")
             if writer:
@@ -899,22 +1026,16 @@ def edit_form(client, journal, field, args, ui, ask=input):
 
 
 def settings_editor(client, journal, args, ui, ask=input):
-    page = 0
-    page_size = max(4, min(10, (ui.height - 12) // (2 if ui.width < 60 else 1)))
-    pages = (len(SELECTABLE) + page_size - 1) // page_size
     while True:
         ui.clear()
-        ui.banner(client, "SETTINGS & EDIT  /  PAGE {} OF {}".format(page + 1, pages))
+        ui.banner(client, "SETTINGS & EDIT")
         try:
             words = read_config(client)
-            show_settings(words, args.model, ui=ui, mode=args.flow_mode,
-                          start=page * page_size, page_size=page_size, interactive=True)
+            show_settings(words, args.model, ui=ui, mode=args.flow_mode, interactive=True)
             choice = ask("Select setting > ").strip()
             if not choice or choice.lower() in ("b", "q"):
                 return
-            if choice.lower() in ("n", "p"):
-                page = (page + (1 if choice.lower() == "n" else -1)) % pages
-            elif choice.lower() == "m":
+            if choice.lower() == "m":
                 choose_model(args, ui, ask)
             elif choice.lower() != "r":
                 field = (SELECTABLE[int(choice) - 1] if choice.isdigit()
@@ -930,14 +1051,10 @@ def menu(client, journal, args, ui=None):
     ui = ui or Terminal()
     while True:
         try:
-            ui.clear()
             try:
-                show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui=ui, brief=True)
+                render_dashboard(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui)
             except ToolError as exc:
-                ui.banner(client, "CONNECTION ERROR")
-                ui.box("NO CURRENT READING", [(str(exc), "error")], "error")
-            ui.box("ACTIONS", [
-                ("[S] Settings & edit  [W] Live  [B] Snapshot  [M] Size  [Enter] Refresh  [Q] Quit", "accent")])
+                render_connection_error(client, exc, ui)
             choice = input("Dashboard > ").strip().lower()
             if choice == "q":
                 return
@@ -985,6 +1102,7 @@ def build_parser():
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                         help="Terminal colors (auto respects NO_COLOR)")
     parser.add_argument("--ascii", action="store_true", help="Use ASCII borders instead of Unicode")
+    parser.add_argument("--compact", action="store_true", help="Always use the compact dashboard")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("menu", help="Interactive SSH terminal menu (default)")
     sub.add_parser("status", help="Read flow and statuses once")
@@ -1009,7 +1127,7 @@ def main(argv=None):
     if args.command == "watch" and args.count is not None and args.count < 1:
         parser.error("--count must be at least 1.")
     try:
-        ui = Terminal(color=args.color, ascii_only=args.ascii)
+        ui = Terminal(color=args.color, ascii_only=args.ascii, compact=args.compact)
         if args.command == "catalog":
             show_settings(model=args.model, ui=ui)
             for field in FIELDS:
@@ -1025,7 +1143,7 @@ def main(argv=None):
         if command == "menu":
             menu(client, journal, args, ui)
         elif command == "status":
-            show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui=ui)
+            render_dashboard(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui, view="status", clear=False)
         elif command == "settings":
             ui.banner(client, "SETTINGS")
             show_settings(read_config(client), args.model, ui=ui, mode=args.flow_mode)

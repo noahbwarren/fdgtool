@@ -10,7 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import fdg_tool as fdg
 
@@ -21,6 +21,7 @@ class FakeModpoll:
     def __init__(self):
         self.words = dict(fdg.Demo().words)
         self.calls = []
+        self.run_options = []
         self.writes = []
         self.output_override = None
         self.write_error = False
@@ -30,6 +31,7 @@ class FakeModpoll:
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
+        self.run_options.append(kwargs)
         address = int(args[args.index("-r") + 1]) - 1
         host_index = args.index(fdg.DEFAULT_HOST)
         values = [int(x) for x in args[host_index + 1:]]
@@ -84,6 +86,7 @@ class ToolTests(unittest.TestCase):
         command = self.fake.calls[0]
         self.assertNotIn("-0", command)
         self.assertEqual(command[command.index("-r") + 1], "1")
+        self.assertEqual(self.fake.run_options[0]["stdin"], subprocess.DEVNULL)
         self.assertEqual(fdg.warning_names(0x100), "Reverse flow")
 
     def test_pi_flow_trace_signed_and_two_display_interpretations(self):
@@ -307,11 +310,18 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(self.fake.writes)
         self.assertFalse(self.directory.exists())
 
-    def test_pagination_and_refresh_are_read_only(self):
-        self.editor(["n", "p", "r", ""])
+    def test_single_settings_list_and_refresh_are_read_only(self):
+        self.editor(["r", ""])
         self.assertFalse(self.fake.writes)
         text = "\n".join(self.messages)
-        self.assertIn("PAGE 2", text)
+        self.assertIn("ALL SETTINGS", text)
+        self.assertNotIn("PAGE ", text)
+        self.assertNotIn("choose a code", text)
+        self.assertIn("199", text)
+        self.assertIn("209", text)
+        self.assertIn("0=m3/h, 1=L/min, 2=CFM", text)
+        self.assertIn("0=kPa, 1=bar, 2=psi", text)
+        self.assertIn("0=C, 1=F", text)
         self.assertIn("[Enter/b] Dashboard", text)
 
     def test_pipe_size_edit_opens_variant_selector_when_needed(self):
@@ -363,7 +373,7 @@ class ToolTests(unittest.TestCase):
                 self.messages.clear()
                 ui = self.ui(width)
                 fdg.show_status(self.client, self.fake.words, ui=ui)
-                fdg.show_settings(self.fake.words, ui=ui, interactive=True, page_size=5)
+                fdg.show_settings(self.fake.words, ui=ui, interactive=True)
                 fdg.show_input_help(fdg.BY_KEY["pipe_od"], self.fake.words, None, "resolution", ui)
                 self.assertTrue(all(len(line) <= width for line in self.messages),
                                 [(len(line), line) for line in self.messages if len(line) > width])
@@ -383,7 +393,60 @@ class ToolTests(unittest.TestCase):
         self.assertIn("\033[?25l", self.messages)
         self.assertEqual(self.messages[-1], "\033[?25h")
         self.assertTrue(any("NO CURRENT READING" in line for line in self.messages))
+        self.assertTrue(any("errors/warnings are unavailable" in line for line in self.messages))
+        self.assertFalse(any("No errors" in line for line in self.messages))
         self.assertFalse(any("-185.24" in line for line in self.messages))
+
+    def test_dashboard_is_complete_in_one_frame_and_fits_the_viewport(self):
+        ansi = fdg.re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+        for width, height in ((80, 24), (60, 20), (40, 18), (80, 12)):
+            for mask in (0, 0x100, 0x481, 0x87FF):
+                with self.subTest(width=width, height=height, mask=hex(mask)):
+                    frames = []
+                    ui = fdg.Terminal(color="never", ascii_only=True, interactive=True,
+                                      width=width, height=height, out=frames.append)
+                    words = dict(self.fake.words)
+                    words[1] = mask
+                    fdg.render_dashboard(self.client, words, "resolution", ui)
+                    self.assertEqual(len(frames), 1)
+                    self.assertTrue(frames[0].startswith("\033[2J\033[H"))
+                    lines = ansi.sub("", frames[0]).splitlines()
+                    self.assertLessEqual(len(lines), height - 2)  # Keep the input prompt on-screen.
+                    self.assertTrue(all(len(line) < width for line in lines))
+                    flattened = " ".join(" ".join(line.strip(" |+-").split()) for line in lines)
+                    self.assertIn("[Q] Quit", flattened)
+                    self.assertIn("ERRORS & WARNINGS", flattened)
+                    if mask:
+                        for bit, name in enumerate(fdg.WARNINGS):
+                            if mask & (1 << bit):
+                                self.assertIn(name, flattened)
+                        self.assertNotIn("No errors", flattened)
+                    else:
+                        self.assertIn("No errors", flattened)
+
+    def test_dashboard_reads_new_terminal_size_on_each_refresh(self):
+        with patch.object(fdg.os, "get_terminal_size", return_value=fdg.os.terminal_size((100, 40))) as size:
+            frames = []
+            ui = fdg.Terminal(color="never", ascii_only=True, interactive=True, out=frames.append)
+            fdg.render_dashboard(self.client, self.fake.words, "resolution", ui)
+            self.assertEqual((ui.width, ui.height), (99, 40))
+            size.return_value = fdg.os.terminal_size((40, 18))
+            fdg.render_dashboard(self.client, self.fake.words, "resolution", ui)
+            self.assertEqual((ui.width, ui.height), (39, 18))
+            lines = fdg.re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", frames[-1]).splitlines()
+            self.assertTrue(all(len(line) <= 39 for line in lines))
+            self.assertLessEqual(len(lines), 16)
+
+    def test_dashboard_stdout_is_written_and_flushed_once(self):
+        stream = Mock()
+        stream.encoding = "utf-8"
+        stream.fileno.side_effect = OSError("No terminal")
+        with patch("sys.stdout", stream):
+            ui = fdg.Terminal(color="never", ascii_only=True, interactive=True, width=80, height=24)
+            fdg.render_dashboard(self.client, self.fake.words, "resolution", ui)
+        stream.write.assert_called_once()
+        stream.flush.assert_called_once()
+        self.assertIn("[Q] Quit", stream.write.call_args[0][0])
 
     def test_live_trend_includes_recent_flow_and_keeps_csv_decoding(self):
         self.assertEqual(len(fdg.sparkline([fdg.Decimal(1)] * 100, 20, False)), 20)
