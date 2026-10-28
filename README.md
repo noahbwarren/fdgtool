@@ -15,14 +15,15 @@ export FDG_HOST=YOUR_METER_IP
 python3 fdg_tool.py
 ```
 
-Version **1.1.1** shows all settings in a single list with numbered choice legends.
-It includes a colored dashboard with measurement cards, a live flow trend, and
-a settings editor with unit-aware decimal examples. Colors and Unicode
-borders turn on automatically in a compatible SSH terminal. No packages are required.
+Version **1.1.2** defaults to simple, scrolling text for reliable SSH operation.
+It does not clear the screen, reposition or hide the cursor, emit color escape
+codes, or draw Unicode borders. Each selected setting prints a complete fresh form
+before its input prompt, including all numbered choices or the unit/decimal example.
+Output is explicitly flushed and retained in terminal scrollback. No packages are required.
 
-The dashboard refreshes as a complete frame and checks the current terminal size
-each time. It switches to a compact layout when the full view would scroll out
-of the window. The **ERRORS & WARNINGS** area lists the meter's decoded errors
+All settings appear in one list with numbered choice legends. The compact
+dashboard checks the current terminal size each time. The **ERRORS & WARNINGS**
+area lists the meter's decoded errors
 and warnings, including reverse flow, or displays **No errors** when the status
 word is zero. A failed read displays an unavailable status instead of reusing an
 old error state. Modpoll subprocesses do not share the menu's keyboard input.
@@ -31,7 +32,7 @@ The menu displays current flow, raw flow, peak/bottom hold, integrated flow,
 leak flow, pressure, conversion basis, stability, output states, initialization,
 error/warning names (including reverse flow), and operation statuses.
 
-- `w`: Live dashboard and trend, refreshed approximately every second. Ctrl+C returns to the menu.
+- `w`: Append timestamped live readings approximately every second. Ctrl+C returns to the menu.
 - `s`: Open **Settings & edit**. Type a setting number to edit it directly.
 - `e`: Alias for `s`, retained for users of version 1.0.
 - `b`: Save a settings snapshot.
@@ -41,8 +42,8 @@ error/warning names (including reverse flow), and operation statuses.
 
 In **Settings & edit**, the table groups settings by flow, pipe installation,
 gas/conversion, and display units. All 22 editable settings appear in one list;
-use terminal scrollback if the list is taller than the window. The **ENTER / CHOICES**
-column shows the decimal pattern and unit for numbers, or the actual numbered
+use terminal scrollback if the list is taller than the window. Each row shows
+the current value plus the decimal pattern and unit for numbers, or the numbered
 choices, such as `0=m3/h, 1=L/min, 2=CFM`. Longer choices wrap without being cut off.
 Type a setting number, manual register address, or setting name.
 Use `r` to refresh or Enter to return to the dashboard.
@@ -111,8 +112,11 @@ python3 fdg_tool.py --interval 2 watch --count 30 --csv flow-after.csv
 # Override connection or executable path
 python3 fdg_tool.py --host YOUR_METER_IP --modpoll /usr/local/bin/modpoll status
 
-# Terminal appearance controls (also respects the NO_COLOR environment variable)
-python3 fdg_tool.py --color never --ascii
+# Optional decorative interface for terminals known to handle ANSI redraws
+python3 fdg_tool.py --pretty
+
+# Appearance controls apply to the optional decorative interface
+python3 fdg_tool.py --pretty --color never --ascii
 
 # Force the compact dashboard if preferred
 python3 fdg_tool.py --compact
@@ -263,9 +267,11 @@ configuration, snapshots, failed writes, verification and logging. The interface
 tests cover editing directly from Settings, decimal examples in the current unit,
 input correction, read-only fields, the complete settings list and numbered choices,
 model selection, terminal widths,
-color controls and cursor restoration after failed reads. Dashboard checks cover
+color controls and cursor restoration in optional decorative mode. Dashboard checks cover
 complete single-frame redraws, resizing, short/narrow viewports, and both clear
-and active meter error states. Run them with:
+and active meter error states. The default settings-to-edit transition is checked
+through the actual CLI to confirm complete choice forms with no cursor-control
+escape sequences. Run them with:
 
 ```bash
 python3 -m unittest -v

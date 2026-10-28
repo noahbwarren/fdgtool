@@ -381,14 +381,14 @@ class ToolTests(unittest.TestCase):
 
     def test_color_auto_respects_no_color_and_explicit_setting(self):
         with patch.dict("os.environ", {"NO_COLOR": "1"}):
-            self.assertFalse(fdg.Terminal(color="auto", interactive=True).color)
-            self.assertTrue(fdg.Terminal(color="always", interactive=False).color)
-        self.assertFalse(fdg.Terminal(color="never", interactive=True).color)
+            self.assertFalse(fdg.Terminal(color="auto", interactive=True, plain=False).color)
+            self.assertTrue(fdg.Terminal(color="always", interactive=False, plain=False).color)
+        self.assertFalse(fdg.Terminal(color="never", interactive=True, plain=False).color)
 
     def test_live_terminal_restores_cursor_after_failed_read(self):
         self.fake.output_override = "Reply time-out!"
         ui = fdg.Terminal(color="never", ascii_only=True, interactive=True,
-                          width=80, out=self.messages.append)
+                          width=80, out=self.messages.append, plain=False)
         fdg.watch(self.client, count=1, ui=ui)
         self.assertIn("\033[?25l", self.messages)
         self.assertEqual(self.messages[-1], "\033[?25h")
@@ -409,7 +409,7 @@ class ToolTests(unittest.TestCase):
                     words[1] = mask
                     fdg.render_dashboard(self.client, words, "resolution", ui)
                     self.assertEqual(len(frames), 1)
-                    self.assertTrue(frames[0].startswith("\033[2J\033[H"))
+                    self.assertNotIn("\033[", frames[0])
                     lines = ansi.sub("", frames[0]).splitlines()
                     self.assertLessEqual(len(lines), height - 2)  # Keep the input prompt on-screen.
                     self.assertTrue(all(len(line) < width for line in lines))
@@ -447,6 +447,35 @@ class ToolTests(unittest.TestCase):
         stream.write.assert_called_once()
         stream.flush.assert_called_once()
         self.assertIn("[Q] Quit", stream.write.call_args[0][0])
+        self.assertNotIn("\033[", stream.write.call_args[0][0])
+
+    def test_default_edit_form_is_complete_and_has_no_cursor_controls(self):
+        frames = []
+        ui = fdg.Terminal(interactive=True, width=80, height=24, out=frames.append)
+        fdg.render_edit_help(self.client, fdg.BY_KEY["flow_unit"], self.fake.words,
+                             None, "resolution", ui)
+        self.assertEqual(len(frames), 1)
+        self.assertNotIn("\033", frames[0])
+        self.assertIn("EDIT SETTING", frames[0])
+        self.assertIn("Current:", frames[0])
+        self.assertIn("0  m3/h", frames[0])
+        self.assertIn("1  L/min", frames[0])
+        self.assertIn("2  CFM", frames[0])
+        self.assertLessEqual(len(frames[0].splitlines()), 22)
+
+    def test_plain_settings_to_edit_transition_outputs_the_whole_form(self):
+        process = subprocess.run(
+            [fdg.sys.executable, str(Path(fdg.__file__).resolve()), "--demo"],
+            input="s\n1\n\n\nq\n", capture_output=True, text=True, timeout=15)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn("\033", process.stdout)
+        start = process.stdout.index("Select setting > ")
+        end = process.stdout.index("New value > ", start)
+        form = process.stdout[start:end]
+        self.assertIn("EDIT SETTING", form)
+        self.assertIn("0  m3/h", form)
+        self.assertIn("1  L/min", form)
+        self.assertIn("2  CFM", form)
 
     def test_live_trend_includes_recent_flow_and_keeps_csv_decoding(self):
         self.assertEqual(len(fdg.sparkline([fdg.Decimal(1)] * 100, 20, False)), 20)

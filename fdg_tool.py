@@ -24,7 +24,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional
 
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 DEFAULT_HOST = os.environ.get("FDG_HOST", "127.0.0.1")
 RESOLUTION = {0: Decimal("0.001"), 1: Decimal("0.01"),
               2: Decimal("0.1"), 3: Decimal("1")}
@@ -518,18 +518,19 @@ class Terminal:
               "warning": "1;33", "error": "1;31", "dim": "2;37", "normal": "0"}
 
     def __init__(self, color="auto", ascii_only=False, out=print, width=None,
-                 height=None, interactive=None, compact=False):
+                 height=None, interactive=None, compact=False, plain=True):
         self.out = out
         self._width_override, self._height_override = width, height
-        self.compact = compact
+        self.plain = plain
+        self.compact = compact or plain
         self.interactive = (sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
                             if interactive is None else interactive)
         self.refresh_size()
-        self.color = color == "always" or (color == "auto" and self.interactive
-                                           and "NO_COLOR" not in os.environ)
+        self.color = not plain and (color == "always" or (color == "auto" and self.interactive
+                                                         and "NO_COLOR" not in os.environ))
         try:
             "╭─╮│╰╯▁█".encode(sys.stdout.encoding or "ascii")
-            self.unicode = self.interactive and not ascii_only
+            self.unicode = not plain and self.interactive and not ascii_only
         except UnicodeEncodeError:
             self.unicode = False
 
@@ -539,11 +540,16 @@ class Terminal:
         return "\033[{}m{}\033[0m".format(self.COLORS.get(role, "0"), text)
 
     def line(self, text="", role="normal"):
-        self.out(self.style(text, role))
+        rendered = self.style(text, role)
+        if self.out is print:
+            sys.stdout.write(rendered + ("\r\n" if self.interactive else "\n"))
+            sys.stdout.flush()
+        else:
+            self.out(rendered)
 
     def clear(self):
         self.refresh_size()
-        if self.interactive:
+        if self.interactive and not self.plain:
             self.control("\033[2J\033[H")
 
     def refresh_size(self):
@@ -571,7 +577,7 @@ class Terminal:
             raise
         else:
             self.out = original
-            prefix = "\033[2J\033[H" if clear and self.interactive else ""
+            prefix = "\033[2J\033[H" if clear and self.interactive and not self.plain else ""
             newline = "\r\n" if self.interactive else "\n"
             payload = prefix + newline.join(lines) + newline
             if original is print:
@@ -587,7 +593,7 @@ class Terminal:
             self.out(sequence)
 
     def cursor(self, visible):
-        if self.interactive:
+        if self.interactive and not self.plain:
             self.control("\033[?25h" if visible else "\033[?25l")
 
     @staticmethod
@@ -598,6 +604,15 @@ class Terminal:
         return text.ljust(width)
 
     def box(self, title, lines, role="accent"):
+        if self.plain:
+            self.message(title, role)
+            self.line("-" * min(len(title), self.width))
+            for row in lines:
+                text, row_role = row if isinstance(row, tuple) else (str(row), "normal")
+                for part in str(text).splitlines() or [""]:
+                    self.message(part, row_role)
+            self.line()
+            return
         inner = self.width - 4
         left, top, right, side, bottom_left, bottom_right = (
             ("╭", "─", "╮", "│", "╰", "╯") if self.unicode else ("+", "-", "+", "|", "+", "+"))
@@ -612,12 +627,22 @@ class Terminal:
         self.line(bottom_left + top * (self.width - 2) + bottom_right, role)
 
     def banner(self, client, section="DASHBOARD"):
+        if self.plain:
+            self.line()
+            self.message("FD-G {} / {}{}".format(VERSION, section, " / DEMO" if client.demo else ""))
+            self.message("Meter {}:{} / Unit ID {}".format(client.host, client.port, client.unit_id))
+            self.line("-" * min(self.width, 60))
+            return
         self.box("FD-G  /  FIELD CONSOLE", [
             ("{}   |   v{}{}".format(section, VERSION,
              "   |   DEMO / SIMULATED" if client.demo else ""), "accent"),
             "{}:{}  /  Unit ID {}".format(client.host, client.port, client.unit_id)])
 
     def cards(self, cards):
+        if self.plain:
+            for title, value, unit, role in cards:
+                self.message("{}: {} {}".format(title, value, unit), role)
+            return
         if self.width < 72:
             for title, value, unit, role in cards:
                 self.box(title, [(value + " " + unit, role)], role)
@@ -707,6 +732,15 @@ def show_input_help(field, words, model, mode, ui):
     rows += ["Enter = cancel / back.  ? = show this help again.",
              ("Advanced: raw:<integer> enters an unscaled register value.", "dim")]
     ui.box("EDIT  /  {}  [{}]".format(field.title, field.registers), rows)
+
+
+def render_edit_help(client, field, words, model, mode, ui):
+    with ui.frame():
+        ui.banner(client, "EDIT SETTING")
+        try:
+            show_input_help(field, words, model, mode, ui)
+        except ToolError as exc:
+            ui.box("RAW INPUT REQUIRED", [str(exc), "Use raw:<integer>, or Enter to go back."], "warning")
 
 
 def show_status(client, words, mode="resolution", out=print, ui=None, brief=False):
@@ -840,7 +874,7 @@ def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
     lines = []
     # Keep every choice visible. Wrap cells instead of clipping code-to-label mappings.
     compact = ui.width < 72
-    if not compact:
+    if not compact and not ui.plain:
         available = ui.width - 4 - 2 - 7 - 8
         title_width = min(24, max(18, available * 4 // 10))
         value_width = min(22, max(12, available // 4))
@@ -862,6 +896,8 @@ def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
         value = field.display(words, model, mode) if words is not None else "--"
         if words is not None and field.enum(model) is not None:
             value = label(field.enum(model), field.raw_value(words))
+        elif field.address == 196 and model is None and words is not None:
+            value = "code {} (select size variant)".format(field.raw_value(words))
         try:
             if words is not None:
                 spec = input_spec(field, words, model, mode)
@@ -872,7 +908,9 @@ def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
         except ToolError:
             form = "raw only"
         title = SHORT_TITLES.get(field.key, field.title)
-        if compact:
+        if ui.plain:
+            lines.append("{:2} [{:7}] {}: {} | {}".format(index + 1, field.registers, title, value, form))
+        elif compact:
             lines += ["{}  [{}] {}".format(index + 1, field.registers, title),
                       "   Current: {}".format(value),
                       "   Enter: {}".format(form)]
@@ -921,7 +959,7 @@ def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution", ui
             stream = path.open("x", newline="", encoding="utf-8")
             writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS)
             writer.writeheader()
-        if not ui.interactive:
+        if not ui.interactive or ui.plain:
             ui.line("Live flow ({}); Ctrl+C returns/stops.{}".format(
                 "resolution-scaled" if mode == "resolution" else "integer",
                 " DEMO - simulated values." if client.demo else ""))
@@ -936,17 +974,19 @@ def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution", ui
                     history.append(Decimal(data["flow_display"]))
                 except InvalidOperation:
                     pass
-                if ui.interactive:
+                if ui.interactive and not ui.plain:
                     render_dashboard(client, words, mode, ui, view="live", history=history, csv_path=csv_path)
                 else:
                     ui.line("{timestamp_utc}  Flow {flow_display} {flow_unit}  raw={flow_raw}  "
                             "P={pressure} {pressure_unit}  Stability={stability}  {warnings}".format(**data))
             except ToolError as exc:
                 data = {"timestamp_utc": stamp(), "error": str(exc)}
-                if ui.interactive:
+                if ui.interactive and not ui.plain:
                     render_connection_error(client, exc, ui, live=True)
                 else:
-                    ui.line("{}  READ FAILED - no current reading: {}".format(data["timestamp_utc"], exc), "error")
+                    with ui.frame(clear=False):
+                        ui.message("{}  NO CURRENT READING: {}".format(data["timestamp_utc"], exc), "error")
+                        ui.message("Meter errors/warnings are unavailable until communication recovers.", "error")
             if writer:
                 writer.writerow(data)
                 stream.flush()
@@ -989,21 +1029,13 @@ def edit_form(client, journal, field, args, ui, ask=input):
             return
     # Use this same unit/resolution snapshot for help, parsing, preview, and preflight.
     words = read_config(client)
-    ui.clear()
-    ui.banner(client, "EDIT SETTING")
-    try:
-        show_input_help(field, words, args.model, args.flow_mode, ui)
-    except ToolError as exc:
-        ui.box("RAW INPUT REQUIRED", [str(exc), "Use raw:<integer>, or Enter to go back."], "warning")
+    render_edit_help(client, field, words, args.model, args.flow_mode, ui)
     while True:
         value = ask("New value > ").strip()
         if not value or value.lower() in ("b", "q"):
             return
         if value == "?":
-            try:
-                show_input_help(field, words, args.model, args.flow_mode, ui)
-            except ToolError as exc:
-                ui.message(exc, "warning")
+            render_edit_help(client, field, words, args.model, args.flow_mode, ui)
             continue
         raw_mode = value.lower().startswith("raw:")
         if raw_mode:
@@ -1027,11 +1059,11 @@ def edit_form(client, journal, field, args, ui, ask=input):
 
 def settings_editor(client, journal, args, ui, ask=input):
     while True:
-        ui.clear()
-        ui.banner(client, "SETTINGS & EDIT")
         try:
             words = read_config(client)
-            show_settings(words, args.model, ui=ui, mode=args.flow_mode, interactive=True)
+            with ui.frame():
+                ui.banner(client, "SETTINGS & EDIT")
+                show_settings(words, args.model, ui=ui, mode=args.flow_mode, interactive=True)
             choice = ask("Select setting > ").strip()
             if not choice or choice.lower() in ("b", "q"):
                 return
@@ -1100,9 +1132,11 @@ def build_parser():
                         help="resolution = raw x register 25/26; integer = unscaled (see README)")
     parser.add_argument("--interval", type=positive_interval, default=1.0, help="Live polling interval in seconds")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
-                        help="Terminal colors (auto respects NO_COLOR)")
+                        help="Colors in --pretty mode (auto respects NO_COLOR)")
     parser.add_argument("--ascii", action="store_true", help="Use ASCII borders instead of Unicode")
     parser.add_argument("--compact", action="store_true", help="Always use the compact dashboard")
+    parser.add_argument("--pretty", action="store_true",
+                        help="Opt into decorative ANSI screens; default is plain scrolling text")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("menu", help="Interactive SSH terminal menu (default)")
     sub.add_parser("status", help="Read flow and statuses once")
@@ -1127,7 +1161,7 @@ def main(argv=None):
     if args.command == "watch" and args.count is not None and args.count < 1:
         parser.error("--count must be at least 1.")
     try:
-        ui = Terminal(color=args.color, ascii_only=args.ascii, compact=args.compact)
+        ui = Terminal(color=args.color, ascii_only=args.ascii, compact=args.compact, plain=not args.pretty)
         if args.command == "catalog":
             show_settings(model=args.model, ui=ui)
             for field in FIELDS:
@@ -1145,8 +1179,10 @@ def main(argv=None):
         elif command == "status":
             render_dashboard(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui, view="status", clear=False)
         elif command == "settings":
-            ui.banner(client, "SETTINGS")
-            show_settings(read_config(client), args.model, ui=ui, mode=args.flow_mode)
+            words = read_config(client)
+            with ui.frame(clear=False):
+                ui.banner(client, "SETTINGS")
+                show_settings(words, args.model, ui=ui, mode=args.flow_mode)
         elif command == "watch":
             watch(client, args.interval, args.count, args.csv, args.flow_mode, ui)
         elif command == "snapshot":
@@ -1156,13 +1192,9 @@ def main(argv=None):
             if not field.writable:
                 raise ToolError("Registers {} are read-only; they are displayed only.".format(field.registers))
             words = read_config(client)
-            ui.banner(client, "EDIT SETTING")
             if not args.raw:
                 # The form and CLI show the same unit/precision instructions.
-                try:
-                    show_input_help(field, words, args.model, args.flow_mode, ui)
-                except ToolError:
-                    pass  # parse() supplies the actionable validation error below.
+                render_edit_help(client, field, words, args.model, args.flow_mode, ui)
             edit_setting(client, journal, field, args.value, args.model, args.raw,
                          before=words, ui=ui, out=ui.message)
         return 0
