@@ -15,17 +15,38 @@ export FDG_HOST=YOUR_METER_IP
 python3 fdg_tool.py
 ```
 
+Version **1.1.0** adds a colored dashboard with measurement cards, a live flow
+trend, and a settings editor with unit-aware decimal examples. Colors and Unicode
+borders turn on automatically in a compatible SSH terminal. No packages are required.
+
 The menu displays current flow, raw flow, peak/bottom hold, integrated flow,
 leak flow, pressure, conversion basis, stability, output states, initialization,
 error/warning names (including reverse flow), and operation statuses.
 
-- `w`: Live readings, refreshed approximately every second. Ctrl+C returns to the menu.
-- `s`: Read all supported settings and their current values.
-- `e`: Edit a setting using its name or the manual's register address.
+- `w`: Live dashboard and trend, refreshed approximately every second. Ctrl+C returns to the menu.
+- `s`: Open **Settings & edit**. Type a setting number to edit it directly.
+- `e`: Alias for `s`, retained for users of version 1.0.
 - `b`: Save a settings snapshot.
 - `m`: Select the FD-G size variant for pipe-size labels and validation.
 - Enter: Refresh the status display.
 - `q`: Exit.
+
+In **Settings & edit**, the table groups settings by flow, pipe installation,
+gas/conversion, and display units. The **INPUT FORMAT** column shows the decimal
+pattern (`0.0`, `0.00`, or `0.000`) or says to choose a code. Type a setting number,
+manual register address, or setting name. Any setting number works on any page.
+Use `n`/`p` for pages, `r` to refresh, or Enter to return to the dashboard.
+
+For a numeric setting, the edit form shows the current unit, allowed range,
+maximum decimal places, smallest step, and an example with its raw encoding.
+Type an ordinary engineering value, such as **110.00** when the form says psi,
+**60.30** for pipe diameter in mm, or **1.403** for specific heat ratio.
+Do not add the unit to the number. An entry like `60.3` is also valid for a
+two-decimal field; extra trailing zeroes do not change the value. Unsupported
+precision stays in the form with an explanation, so you can correct the value.
+For choices, the form lists codes and labels; either input is accepted.
+Review the before/after values, then type `APPLY` to write and verify the setting.
+Enter cancels. Typing `?` in the value prompt repeats the format instructions.
 
 Select the actual size variant from the meter label before editing pipe size (196).
 `FD-G25`, `FD-G50`, `FD-G80`, `FD-G125`, and `FD-G200` are supported, including
@@ -61,8 +82,11 @@ python3 fdg_tool.py set response_time 2.5s
 python3 fdg_tool.py set pipe_od 60.30
 python3 fdg_tool.py set pipe_pressure 500.0
 
-# Enter the combined raw zero-cut integer, not its upper/lower words separately
-python3 fdg_tool.py set zero_cut 180
+# Enter zero cut in the currently displayed flow unit; the form shows its step
+python3 fdg_tool.py set zero_cut 2.5
+
+# Explicit raw zero-cut integer (compatible with version 1.0's raw-count input)
+python3 fdg_tool.py set zero_cut 180 --raw
 
 # Explicit raw register input; 6030 means 60.30 mm for register 108
 python3 fdg_tool.py set 108 6030 --raw
@@ -76,6 +100,9 @@ python3 fdg_tool.py --interval 2 watch --count 30 --csv flow-after.csv
 
 # Override connection or executable path
 python3 fdg_tool.py --host YOUR_METER_IP --modpoll /usr/local/bin/modpoll status
+
+# Terminal appearance controls (also respects the NO_COLOR environment variable)
+python3 fdg_tool.py --color never --ascii
 
 # Save all supported settings, or inspect the register catalog offline
 python3 fdg_tool.py snapshot
@@ -100,7 +127,7 @@ becomes Modpoll `-r 200`, and manual register 0 becomes Modpoll `-r 1`.
 | 25 | `flow_resolution` | Read-only: code 0/1/2/3 = 0.001/0.01/0.1/1 |
 | 26 | `total_resolution` | Read-only: same resolution codes |
 | 100 | `response_time` | 0=1s, 1=2.5s, 2=5s, 3=10s, 4=30s, 5=60s, 6=120s, 7=200s |
-| 101-102 | `zero_cut` | One combined raw unsigned integer, 0-999999 |
+| 101-102 | `zero_cut` | Current flow unit; step from register 25 in resolution mode, whole units in integer mode |
 | 106 | `pipe_material` | 0=Steel, 1=Stainless steel (SUS) |
 | 107 | `advanced_pipe` | 0=OFF, 1=ON |
 | 108 | `pipe_od` | 0.01-300.00 mm, increments of 0.01 mm |
@@ -123,8 +150,10 @@ becomes Modpoll `-r 200`, and manual register 0 becomes Modpoll `-r 1`.
 | 209 | `temperature_unit` | 0=C, 1=F |
 
 Enum settings accept numeric codes or their displayed labels. Numeric settings
-accept engineering values by default, except `zero_cut`, which explicitly uses
-raw counts. `--raw` (CLI) or a `raw:` prefix (menu) accepts raw integers instead.
+accept engineering values by default. **Version 1.1 changes zero cut to engineering
+input too**: with resolution 0.1, an input of `2.5` encodes as raw `25`. If you
+previously entered a raw zero-cut count, add `--raw` to that CLI command.
+`--raw` (CLI) or a `raw:` prefix (menu) accepts raw integers instead.
 Values with unsupported precision are rejected instead of rounded.
 
 Pressure scaling depends on register 208: raw x 0.1 kPa, raw x 0.001 bar,
@@ -172,8 +201,11 @@ python3 fdg_tool.py --flow-mode integer watch
 ```
 
 Both modes retain raw data in CSV logs. Unknown resolution codes retain the raw
-value and mark the scaled display unavailable. Zero cut remains a raw-count edit
-in either mode so this documentation ambiguity cannot silently scale a write.
+value and mark the scaled display unavailable. Zero cut follows the same selected
+flow interpretation: raw x register 25's resolution in resolution mode, or whole
+engineering units in integer mode. The preview always shows its encoded raw value.
+Until flow scaling has been compared with a trusted reading, use explicit raw
+input for zero cut when you already know the register integer you want to write.
 CFM labels follow register 199; NTP/STP basis is reported separately. A unit
 change does not trigger extra writes to response, cut-off, pressure, or other settings.
 
@@ -214,7 +246,10 @@ The vendor also provides [Modpoll command documentation](https://www.modbusdrive
 
 The tool has offline behavior tests for addressing, parsing, signed decoding,
 word order, the editable-register boundary, input scaling, cancellation, stale
-configuration, snapshots, failed writes, verification and logging. Run them with:
+configuration, snapshots, failed writes, verification and logging. The interface
+tests cover editing directly from Settings, decimal examples in the current unit,
+input correction, read-only fields, pagination, model selection, terminal widths,
+color controls and cursor restoration after failed reads. Run them with:
 
 ```bash
 python3 -m unittest -v

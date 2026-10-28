@@ -6,21 +6,24 @@ Only Modpoll sees address + 1, with -0 deliberately omitted for Modpoll 3.4.
 """
 
 import argparse
+from collections import deque
 import csv
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_HOST = os.environ.get("FDG_HOST", "127.0.0.1")
 RESOLUTION = {0: Decimal("0.001"), 1: Decimal("0.01"),
               2: Decimal("0.1"), 3: Decimal("1")}
@@ -111,16 +114,24 @@ class Field:
             return PIPE_SIZES.get(model)
         return self.choices
 
-    def measure(self, words):
+    def measure(self, words, flow_mode="resolution"):
+        if self.address == 101:
+            if flow_mode == "integer":
+                return Decimal(1), unit_labels(words)[0]
+            if words[25] not in RESOLUTION:
+                raise ToolError("Unknown flow resolution; use raw:<integer> or --raw for zero cut.")
+            return RESOLUTION[words[25]], unit_labels(words)[0]
         if self.address == 201:
             if words[208] not in PRESSURE:
                 raise ToolError("Unknown pressure unit; use --raw or correct register 208.")
             return PRESSURE[words[208]]
         if self.address == 116:
+            if words[209] not in (0, 1):
+                raise ToolError("Unknown temperature unit; use raw:<integer> or --raw.")
             return Decimal("0.1"), label({0: "degC", 1: "degF"}, words[209])
         return Decimal(self.scale), self.unit
 
-    def display(self, words, model=None):
+    def display(self, words, model=None, flow_mode="resolution"):
         raw = self.raw_value(words)
         options = self.enum(model)
         if options is not None:
@@ -128,12 +139,13 @@ class Field:
         if self.address == 196:
             return "code {} (size variant not selected)".format(raw)
         try:
-            scale, unit = self.measure(words)
+            scale, unit = self.measure(words, flow_mode)
         except ToolError:
             return "{} raw (unknown unit)".format(raw)
         return "{} {}".format(decimal_text(Decimal(raw) * scale), unit).strip()
 
-    def parse(self, text, words, model=None, raw_mode=False):
+    def parse(self, text, words, model=None, raw_mode=False, flow_mode="resolution"):
+        text = text.strip()
         if not self.writable:
             raise ToolError("Registers {} are read-only in this manual.".format(self.registers))
         if self.address == 196 and model is None:
@@ -149,15 +161,20 @@ class Field:
             raise ToolError("Enter a listed code/label or a numeric value.")
         if not number.is_finite():
             raise ToolError("Value must be finite.")
-        scale = Decimal(1) if raw_mode or options else self.measure(words)[0]
+        scale = Decimal(1) if raw_mode or options else self.measure(words, flow_mode)[0]
         raw = number / scale
         if raw != raw.to_integral_value():
-            raise ToolError("Value must be an exact multiple of {}.".format(scale))
+            places = max(0, -scale.as_tuple().exponent)
+            raise ToolError("Use up to {} decimal place(s); the smallest step is {}.".format(places, scale))
         raw = int(raw)
         if options is not None and raw not in options:
             raise ToolError("Allowed codes: " + ", ".join(map(str, options)))
         if not self.minimum <= raw <= self.maximum:
-            raise ToolError("Raw value must be {} to {}.".format(self.minimum, self.maximum))
+            if raw_mode or options:
+                raise ToolError("Allowed integer range: {} to {}.".format(self.minimum, self.maximum))
+            raise ToolError("Allowed range: {} to {} {}.".format(
+                Decimal(self.minimum) * scale, Decimal(self.maximum) * scale,
+                self.measure(words, flow_mode)[1]))
         return raw
 
 
@@ -168,8 +185,9 @@ FIELDS = [
           choices={0: "0.001", 1: "0.01", 2: "0.1", 3: "1"}, writable=False),
     Field("response_time", 100, "Response time", 0, 7,
           choices=dict(enumerate(["1s", "2.5s", "5s", "10s", "30s", "60s", "120s", "200s"]))),
-    Field("zero_cut", 101, "Zero cut flow rate", 0, 999999, width=2, unit="raw counts",
-          note="Enter the combined raw integer for registers 101-102; no decimal scaling is assumed."),
+    Field("zero_cut", 101, "Zero cut flow rate", 0, 999999, width=2,
+          note="Enter flow in the current unit. Resolution mode uses register 25; integer mode uses whole units. "
+               "Use explicit raw input if the flow decimal interpretation has not been confirmed."),
     Field("pipe_material", 106, "Pipe material", 0, 1,
           choices={0: "Steel", 1: "Stainless steel (SUS)"}),
     Field("advanced_pipe", 107, "Advanced pipe settings", 0, 1, choices={0: "OFF", 1: "ON"}),
@@ -217,8 +235,13 @@ BY_ADDRESS = {f.address: f for f in FIELDS}
 
 
 def find_field(value):
+    value = value.strip().lower()
     if value in BY_KEY:
         return BY_KEY[value]
+    for field in FIELDS:
+        names = (field.key, field.title, SHORT_TITLES.get(field.key, ""))
+        if any(name and normalize(value) == normalize(name) for name in names):
+            return field
     try:
         address = int(value)
     except ValueError:
@@ -334,14 +357,16 @@ def validate_change(field, raw, words):
 
 
 class Journal:
-    def __init__(self, directory, client):
+    def __init__(self, directory, client, flow_mode="resolution"):
         self.directory = Path(directory)
         self.client = client
+        self.flow_mode = flow_mode
 
     def metadata(self):
         return {"timestamp_utc": stamp(), "host": self.client.host,
                 "port": self.client.port, "unit_id": self.client.unit_id,
                 "demo": self.client.demo, "tool_version": VERSION,
+                "flow_mode": self.flow_mode,
                 "addressing": "manual zero-based relative addresses"}
 
     def snapshot(self, words, model=None, purpose="manual"):
@@ -354,7 +379,7 @@ class Journal:
         data.update({"purpose": purpose, "model": model, "registers": words,
                      "settings": {f.key: {"registers": f.registers,
                                           "raw": f.raw_value(words),
-                                          "display": f.display(words, model),
+                                          "display": f.display(words, model, self.flow_mode),
                                           "writable": f.writable} for f in FIELDS}})
         with path.open("x", encoding="utf-8") as stream:
             json.dump(data, stream, indent=2)
@@ -374,17 +399,26 @@ class Journal:
 
 
 def edit_setting(client, journal, field, value, model=None, raw_mode=False,
-                 confirm=input, out=print):
+                 confirm=input, out=print, before=None, ui=None):
     # Reject read-only/unknown words before connecting to the device.
     if not field.writable:
         raise ToolError("Registers {} are read-only; they are displayed only.".format(field.registers))
-    before = read_config(client)
-    raw = field.parse(value, before, model, raw_mode)
+    before = dict(before) if before is not None else read_config(client)
+    mode = journal.flow_mode
+    raw = field.parse(value, before, model, raw_mode, mode)
     proposed = validate_change(field, raw, before)
     old = field.raw_value(before)
-    out("{} [{}] {}: {} -> {}".format(client.host, field.registers, field.title,
-                                     field.display(before, model), field.display(proposed, model)))
-    out("Raw integer: {} -> {}".format(old, raw))
+    if ui:
+        ui.box("REVIEW CHANGE", [
+            "Meter   {} | register {}".format(client.host, field.registers),
+            "Setting {}".format(field.title),
+            "Current {}".format(field.display(before, model, mode)),
+            ("New     {}".format(field.display(proposed, model, mode)), "accent"),
+            "Encoded register integer: {} -> {}".format(old, raw)])
+    else:
+        out("{} [{}] {}: {} -> {}".format(client.host, field.registers, field.title,
+            field.display(before, model, mode), field.display(proposed, model, mode)))
+        out("Raw integer: {} -> {}".format(old, raw))
     if field.note:
         out(field.note)
     if raw == old:
@@ -430,7 +464,7 @@ def edit_setting(client, journal, field, value, model=None, raw_mode=False,
         for other in FIELDS:
             if other.key != field.key and other.raw_value(before) != other.raw_value(after):
                 out("Also changed [{}] {}: {} -> {}".format(other.registers, other.title,
-                    other.display(before, model), other.display(after, model)))
+                    other.display(before, model, mode), other.display(after, model, mode)))
         out("Updated settings: {}".format(post))
     except (ToolError, OSError) as exc:
         out("Target value was verified; the full settings refresh failed: {}".format(exc))
@@ -477,39 +511,249 @@ def measurements(words, mode):
             "warnings": warning_names(words[1]), "error": ""}
 
 
-def show_status(client, words, mode="resolution", out=print):
+class Terminal:
+    """Small, dependency-free ANSI interface with plain-output fallbacks."""
+    COLORS = {"accent": "1;36", "title": "1;37", "good": "1;32",
+              "warning": "1;33", "error": "1;31", "dim": "2;37", "normal": "0"}
+
+    def __init__(self, color="auto", ascii_only=False, out=print, width=None,
+                 height=None, interactive=None):
+        size = shutil.get_terminal_size((100, 30))
+        self.width = max(24, min(width or size.columns, 120))
+        self.height = height or size.lines
+        self.out = out
+        self.interactive = (sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+                            if interactive is None else interactive)
+        self.color = color == "always" or (color == "auto" and self.interactive
+                                           and "NO_COLOR" not in os.environ)
+        try:
+            "╭─╮│╰╯▁█".encode(sys.stdout.encoding or "ascii")
+            self.unicode = self.interactive and not ascii_only
+        except UnicodeEncodeError:
+            self.unicode = False
+
+    def style(self, text, role="normal"):
+        if not self.color:
+            return str(text)
+        return "\033[{}m{}\033[0m".format(self.COLORS.get(role, "0"), text)
+
+    def line(self, text="", role="normal"):
+        self.out(self.style(text, role))
+
+    def clear(self):
+        if self.interactive:
+            self.control("\033[2J\033[H")
+
+    def control(self, sequence):
+        if self.out is print:
+            print(sequence, end="", flush=True)
+        else:
+            self.out(sequence)
+
+    def cursor(self, visible):
+        if self.interactive:
+            self.control("\033[?25h" if visible else "\033[?25l")
+
+    @staticmethod
+    def fit(text, width):
+        text = str(text)
+        if len(text) > width:
+            return text[:max(0, width - 2)] + ".."
+        return text.ljust(width)
+
+    def box(self, title, lines, role="accent"):
+        inner = self.width - 4
+        left, top, right, side, bottom_left, bottom_right = (
+            ("╭", "─", "╮", "│", "╰", "╯") if self.unicode else ("+", "-", "+", "|", "+", "+"))
+        heading = (" " + title + " ")[:self.width - 2]
+        self.line(left + heading + top * (self.width - 2 - len(heading)) + right, role)
+        for row in lines:
+            text, row_role = row if isinstance(row, tuple) else (str(row), "normal")
+            for part in str(text).splitlines() or [""]:
+                for wrapped in textwrap.wrap(part, width=inner, replace_whitespace=False,
+                                              drop_whitespace=False) or [""]:
+                    self.line(side + " " + wrapped.ljust(inner) + " " + side, row_role)
+        self.line(bottom_left + top * (self.width - 2) + bottom_right, role)
+
+    def banner(self, client, section="DASHBOARD"):
+        self.box("FD-G  /  FIELD CONSOLE", [
+            ("{}   |   v{}{}".format(section, VERSION,
+             "   |   DEMO / SIMULATED" if client.demo else ""), "accent"),
+            "{}:{}  /  Unit ID {}".format(client.host, client.port, client.unit_id)])
+
+    def cards(self, cards):
+        if self.width < 72:
+            for title, value, unit, role in cards:
+                self.box(title, [(value + " " + unit, role)], role)
+            return
+        sizes = [(self.width - 2) // 3] * 3
+        sizes[-1] += self.width - 2 - sum(sizes)
+        rows = [[] for _ in range(4)]
+        for size, (title, value, unit, role) in zip(sizes, cards):
+            left, top, right, side, bl, br = (
+                ("╭", "─", "╮", "│", "╰", "╯") if self.unicode else ("+", "-", "+", "|", "+", "+"))
+            heading = " " + title + " "
+            cells = [left + heading + top * (size - 2 - len(heading)) + right,
+                     side + " " + self.fit(value, size - 4) + " " + side,
+                     side + " " + self.fit(unit, size - 4) + " " + side,
+                     bl + top * (size - 2) + br]
+            for index, cell in enumerate(cells):
+                rows[index].append(self.style(cell, role if index == 1 else "accent"))
+        for row in rows:
+            self.out(" ".join(row))
+
+    def message(self, text, role="normal"):
+        for part in textwrap.wrap(str(text), self.width) or [""]:
+            self.line(part, role)
+
+
+def pretty_number(value):
+    try:
+        return format(Decimal(str(value)), ",f")
+    except InvalidOperation:
+        return str(value)
+
+
+SETTING_GROUPS = [
+    ("FLOW & RESPONSE", ["flow_unit", "response_time", "zero_cut", "integration_direction", "flow_direction"]),
+    ("PIPE INSTALLATION", ["pipe_material", "advanced_pipe", "pipe_od", "pipe_thickness", "pipe_size", "piping_standard"]),
+    ("GAS & CONVERSION", ["gas_type", "specific_heat_ratio", "molecular_weight", "span",
+                          "conversion", "reference_temp", "pressure_input", "pipe_pressure"]),
+    ("DISPLAY UNITS", ["additional_unit", "pressure_unit", "temperature_unit"]),
+]
+SELECTABLE = [BY_KEY[key] for _, keys in SETTING_GROUPS for key in keys]
+SHORT_TITLES = {"pipe_od": "Pipe outer diameter", "pipe_thickness": "Pipe wall thickness",
+                "reference_temp": "Reference temperature", "total_resolution": "Total resolution",
+                "molecular_weight": "Molecular weight", "additional_unit": "Add. measurement unit"}
+
+
+def input_spec(field, words, model=None, mode="resolution"):
+    """One source of truth for the form's precision, units, examples and limits."""
+    options = field.enum(model)
+    if options is not None:
+        return {"choices": options, "format": "choose a code"}
+    if field.address == 196:
+        return {"choices": None, "format": "select variant"}
+    scale, unit = field.measure(words, mode)
+    places = max(0, -scale.as_tuple().exponent)
+    example = {
+        101: Decimal("1"), 108: Decimal("60.30"), 109: Decimal("3.92"),
+        111: Decimal("1.403"), 112: Decimal("28.97"), 113: Decimal("1.000"),
+        116: Decimal("68.0") if words[209] == 1 else Decimal("20.0"),
+        201: {0: Decimal("500.0"), 1: Decimal("5.000"), 2: Decimal("110.00")}.get(words[208], Decimal(0)),
+    }.get(field.address, Decimal(field.minimum) * scale)
+    return {"choices": None, "format": "0." + "0" * places if places else "whole number",
+            "scale": scale, "unit": unit, "decimals": places,
+            "minimum": decimal_text(Decimal(field.minimum) * scale),
+            "maximum": decimal_text(Decimal(field.maximum) * scale),
+            "example": format(example, ".{}f".format(places)),
+            "raw_example": int(example / scale)}
+
+
+def show_input_help(field, words, model, mode, ui):
+    spec = input_spec(field, words, model, mode)
+    rows = ["Current: {}".format(field.display(words, model, mode))]
+    if spec.get("choices") is not None:
+        rows += [("{}  {}{}".format(code, name,
+                  "   < current" if code == field.raw_value(words) else ""), "accent")
+                 for code, name in spec["choices"].items()]
+        rows += ["Type a code or its label. Example: {}".format(next(iter(spec["choices"])))]
+    else:
+        rows += [("Enter the value in {}.".format(spec["unit"] or "the units shown below"), "accent"),
+                 "Range: {} to {} {}".format(spec["minimum"], spec["maximum"], spec["unit"]),
+                 "Decimals: up to {} | Smallest step: {} {}".format(
+                     spec["decimals"], spec["scale"], spec["unit"]),
+                 ("Example input: {}  (encodes as raw {})".format(spec["example"], spec["raw_example"]), "good"),
+                 "Type the number only; the tool handles the decimal point and register conversion."]
+    if field.note:
+        rows.append((field.note, "dim"))
+    rows += ["Enter = cancel / back.  ? = show this help again.",
+             ("Advanced: raw:<integer> enters an unscaled register value.", "dim")]
+    ui.box("EDIT  /  {}  [{}]".format(field.title, field.registers), rows)
+
+
+def show_status(client, words, mode="resolution", out=print, ui=None, brief=False):
+    ui = ui or Terminal(out=out)
     data = measurements(words, mode)
-    out("\n{} | {}:{} | unit ID {}{}".format(data["timestamp_utc"], client.host, client.port,
-        client.unit_id, " | DEMO - simulated registers" if client.demo else ""))
-    mode_label = "resolution-scaled" if mode == "resolution" else "integer"
-    out("Flow ({}): {} {} | raw signed: {}".format(mode_label, data["flow_display"],
-                                                              data["flow_unit"], data["flow_raw"]))
-    out("Peak: {} | Bottom: {} | Leak: {} {}".format(
-        flow_value(i32(words, 6), words[25], mode), flow_value(i32(words, 8), words[25], mode),
-        flow_value(u32(words, 12), words[25], mode), data["flow_unit"]))
-    out("Integrated: {} {} | raw: {}".format(data["total_display"], data["total_unit"], data["total_raw"]))
-    out("Pressure: {} {} | Input: {} | Conversion: {} | Ref: {}".format(
-        data["pressure"], data["pressure_unit"], BY_KEY["pressure_input"].display(words),
-        data["conversion"], BY_KEY["reference_temp"].display(words)))
-    out("Stability: {} | Initial settings: {} | Output 1: {} | Output 2: {}".format(
-        data["stability"], label({0: "Incomplete", 1: "Complete"}, words[0]),
-        "ON" if words[15] & 1 else "OFF", "ON" if words[15] & 2 else "OFF"))
-    out("Errors/warnings {}: {}".format(data["error_mask"], data["warnings"]))
-    out("Resolution [25]: {} | Integrated [26]: {} (read-only)".format(
+    ui.banner(client)
+    ui.cards([
+        ("FLOW", pretty_number(data["flow_display"]), data["flow_unit"], "warning" if words[1] & 0x100 else "accent"),
+        ("PRESSURE", pretty_number(data["pressure"]), data["pressure_unit"], "accent"),
+        ("STABILITY", "{} / 4".format(words[14]), data["stability"], "good" if words[14] == 4 else "warning")])
+    ui.box("MEASUREMENTS", [
+        "Total: {} {}  |  Leak: {} {}".format(pretty_number(data["total_display"]), data["total_unit"],
+            flow_value(u32(words, 12), words[25], mode), data["flow_unit"]),
+        "Peak: {}  |  Bottom: {} {}".format(flow_value(i32(words, 6), words[25], mode),
+            flow_value(i32(words, 8), words[25], mode), data["flow_unit"]),
+        "Basis: {}  /  {}  |  Pressure: {}".format(data["conversion"],
+            BY_KEY["reference_temp"].display(words), label(BY_KEY["pressure_input"].choices, words[200])),
+        "Initial settings: {}  |  Outputs: 1={}  2={}".format(
+            label({0: "Incomplete", 1: "Complete"}, words[0]),
+            "ON" if words[15] & 1 else "OFF", "ON" if words[15] & 2 else "OFF")])
+    ui.box("METER STATUS  /  {}".format(data["error_mask"]),
+           [(data["warnings"], "warning" if words[1] else "good")], "warning" if words[1] else "good")
+    ui.message("Raw flow: {} | {} | Steps: {} / {}{}".format(
+        data["flow_raw"], "resolution-scaled" if mode == "resolution" else "integer",
         label({k: str(v) for k, v in RESOLUTION.items()}, words[25]),
-        label({k: str(v) for k, v in RESOLUTION.items()}, words[26])))
-    out("Operations: initialization={} | static leakage={} | origin adjustment={}".format(
-        label({0: "Idle", 1: "Executing", 2: "Finish"}, words[22]),
-        label({0: "Idle", 1: "Executing", 2: "Success"}, words[23]),
-        label({0: "Idle", 1: "Executing", 2: "Success", 3: "Failure"}, words[24])))
+        label({k: str(v) for k, v in RESOLUTION.items()}, words[26]),
+        " | " + data["timestamp_utc"][11:19] + " UTC" if brief else ""), "dim")
+    if not brief or any(words[address] for address in (22, 23, 24)):
+        ui.message("Operations: init={} / static leak={} / origin={}".format(
+            label({0: "Idle", 1: "Executing", 2: "Finish"}, words[22]),
+            label({0: "Idle", 1: "Executing", 2: "Success"}, words[23]),
+            label({0: "Idle", 1: "Executing", 2: "Success", 3: "Failure"}, words[24])), "dim")
+    if not brief:
+        ui.message("Updated {} (UTC)".format(data["timestamp_utc"]), "dim")
 
 
-def show_settings(words=None, model=None, out=print):
-    out("\nAddresses are zero-based as printed in the manual. Pipe size variant: " + (model or "not selected"))
-    for field in FIELDS:
-        access = "RW" if field.writable else "RO"
-        value = field.display(words, model) if words is not None else ""
-        out("{:>7} {:2} {:23} {}".format(field.registers, access, field.key, value or field.title))
+def show_settings(words=None, model=None, out=print, ui=None, mode="resolution",
+                  start=0, page_size=None, interactive=False):
+    ui = ui or Terminal(out=out)
+    end = min(len(SELECTABLE), start + (page_size or len(SELECTABLE)))
+    lines = []
+    # Fit a table to 60+ columns; use stacked entries on narrower terminals.
+    compact = ui.width < 60
+    if not compact:
+        available = ui.width - 4 - 2 - 7 - 8
+        format_width = 13 if ui.width >= 78 else 10
+        title_width = min(24, (available - format_width) // 2 + 2)
+        value_width = available - format_width - title_width
+        widths = [2, 7, title_width, value_width, format_width]
+        def row(cells):
+            return "  ".join(ui.fit(cell, width) for cell, width in zip(cells, widths))
+        lines.append((row(["#", "REG", "SETTING", "CURRENT", "INPUT FORMAT"]), "dim"))
+    previous_group = None
+    for index in range(start, end):
+        field = SELECTABLE[index]
+        group = next(name for name, keys in SETTING_GROUPS if field.key in keys)
+        if group != previous_group:
+            lines.append((group, "accent"))
+            previous_group = group
+        value = field.display(words, model, mode) if words is not None else "--"
+        if words is not None and field.enum(model) is not None:
+            value = label(field.enum(model), field.raw_value(words))
+        try:
+            form = input_spec(field, words, model, mode)["format"] if words is not None else (
+                "choose a code" if field.choices else "see editor")
+        except ToolError:
+            form = "raw only"
+        title = SHORT_TITLES.get(field.key, field.title)
+        if compact:
+            lines += ["{}  [{}] {}".format(index + 1, field.registers, title),
+                      "   {} | input: {}".format(value, form)]
+        else:
+            lines.append(row([str(index + 1), field.registers, title, value, form]))
+    ui.box("SETTINGS & EDIT  /  {}-{} OF {}".format(start + 1, end, len(SELECTABLE)), lines)
+    if words is not None:
+        ui.message("Read-only steps: flow [25]={}, total [26]={}. Size variant: {}.".format(
+            label({k: str(v) for k, v in RESOLUTION.items()}, words[25]),
+            label({k: str(v) for k, v in RESOLUTION.items()}, words[26]), model or "not selected"), "dim")
+    if interactive:
+        ui.message("Type a setting # (1-{}), register address, or name to EDIT.".format(len(SELECTABLE)), "accent")
+        ui.message("[n] Next  [p] Previous  [r] Refresh  [m] Size variant  [Enter/b] Dashboard", "dim")
+    else:
+        ui.message("To edit: run the interactive tool and press S, then select a setting number.", "accent")
+        ui.message("CLI: python3 fdg_tool.py --host <HOST> set <register-or-name> <value>", "dim")
 
 
 CSV_COLUMNS = ["timestamp_utc", "flow_raw", "flow_display", "flow_mode", "flow_unit",
@@ -518,8 +762,22 @@ CSV_COLUMNS = ["timestamp_utc", "flow_raw", "flow_display", "flow_mode", "flow_u
                "initialized", "error_mask", "warnings", "error"]
 
 
-def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution"):
+def sparkline(values, width, unicode=True):
+    values = list(values)[-width:]
+    if not values:
+        return "Waiting for samples"
+    low, high = min(values), max(values)
+    bars = "▁▂▃▄▅▆▇█" if unicode else ".:-=+*#%@"
+    if high == low:
+        return bars[len(bars) // 2] * len(values)
+    return "".join(bars[int((value - low) / (high - low) * (len(bars) - 1))]
+                   for value in values)
+
+
+def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution", ui=None):
+    ui = ui or Terminal()
     stream = None
+    history = deque(maxlen=min(60, ui.width - 4))
     try:
         writer = None
         if csv_path:
@@ -528,19 +786,40 @@ def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution"):
             stream = path.open("x", newline="", encoding="utf-8")
             writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS)
             writer.writeheader()
-        print("Live flow ({}); Ctrl+C returns/stops.{}".format(
-            "resolution-scaled" if mode == "resolution" else "integer",
-            " DEMO - simulated values." if client.demo else ""))
+        if not ui.interactive:
+            ui.line("Live flow ({}); Ctrl+C returns/stops.{}".format(
+                "resolution-scaled" if mode == "resolution" else "integer",
+                " DEMO - simulated values." if client.demo else ""))
+        ui.cursor(False)
         sample = 0
         while count is None or sample < count:
             started = time.monotonic()
             try:
-                data = measurements(read_ranges(client, STATUS_RANGES), mode)
-                print("{timestamp_utc}  Flow {flow_display} {flow_unit}  raw={flow_raw}  "
-                      "P={pressure} {pressure_unit}  Stability={stability}  {warnings}".format(**data))
+                words = read_ranges(client, STATUS_RANGES)
+                data = measurements(words, mode)
+                try:
+                    history.append(Decimal(data["flow_display"]))
+                except InvalidOperation:
+                    pass
+                if ui.interactive:
+                    ui.clear()
+                    show_status(client, words, mode, ui=ui, brief=True)
+                    ui.box("FLOW TREND  /  LAST {} SAMPLES".format(len(history)), [
+                        (sparkline(history, ui.width - 4, ui.unicode), "accent")])
+                    ui.message("LIVE  /  Ctrl+C returns to the dashboard.{}".format(
+                        "  CSV: " + str(csv_path) if csv_path else ""), "accent")
+                else:
+                    ui.line("{timestamp_utc}  Flow {flow_display} {flow_unit}  raw={flow_raw}  "
+                            "P={pressure} {pressure_unit}  Stability={stability}  {warnings}".format(**data))
             except ToolError as exc:
                 data = {"timestamp_utc": stamp(), "error": str(exc)}
-                print("{}  READ FAILED - no current reading: {}".format(data["timestamp_utc"], exc))
+                if ui.interactive:
+                    ui.clear()
+                    ui.banner(client, "CONNECTION ERROR")
+                    ui.box("NO CURRENT READING", [(str(exc), "error"),
+                           "Read-only polling will continue. Ctrl+C returns."], "error")
+                else:
+                    ui.line("{}  READ FAILED - no current reading: {}".format(data["timestamp_utc"], exc), "error")
             if writer:
                 writer.writerow(data)
                 stream.flush()
@@ -548,67 +827,135 @@ def watch(client, interval=1.0, count=None, csv_path=None, mode="resolution"):
             if count is None or sample < count:
                 time.sleep(max(0, interval - (time.monotonic() - started)))
     except KeyboardInterrupt:
-        print("\nLive display stopped.")
+        ui.message("Live display stopped.", "dim")
     finally:
+        ui.cursor(True)
         if stream:
             stream.close()
 
 
-def menu(client, journal, args):
-    print("FD-G terminal tool {} | all register addresses are manual addresses".format(VERSION))
-    print("Flow display: {}. Raw integers are also shown; see README for decimal interpretation.".format(args.flow_mode))
+def choose_model(args, ui, ask=input):
+    models = list(PIPE_SIZES)
+    ui.box("SELECT THE METER'S SIZE VARIANT", [
+        "Use the FD-G variant printed on the meter label. L versions use the same choices."] +
+        ["{}  {}".format(index + 1, model) for index, model in enumerate(models)] +
+        ["Type a number or model name. Enter cancels."])
+    while True:
+        value = ask("Size variant > ").strip()
+        if not value:
+            return False
+        try:
+            args.model = models[int(value) - 1] if value.isdigit() and 1 <= int(value) <= len(models) else model_name(value)
+            return True
+        except argparse.ArgumentTypeError as exc:
+            ui.message(exc, "error")
+
+
+def edit_form(client, journal, field, args, ui, ask=input):
+    if not field.writable:
+        ui.box("READ-ONLY VALUE", [field.title + " cannot be changed through this register.",
+               "The meter reports this resolution; it is shown in the dashboard."], "warning")
+        ask("Enter to return to settings: ")
+        return
+    if field.address == 196 and args.model is None:
+        if not choose_model(args, ui, ask):
+            return
+    # Use this same unit/resolution snapshot for help, parsing, preview, and preflight.
+    words = read_config(client)
+    ui.clear()
+    ui.banner(client, "EDIT SETTING")
+    try:
+        show_input_help(field, words, args.model, args.flow_mode, ui)
+    except ToolError as exc:
+        ui.box("RAW INPUT REQUIRED", [str(exc), "Use raw:<integer>, or Enter to go back."], "warning")
+    while True:
+        value = ask("New value > ").strip()
+        if not value or value.lower() in ("b", "q"):
+            return
+        if value == "?":
+            try:
+                show_input_help(field, words, args.model, args.flow_mode, ui)
+            except ToolError as exc:
+                ui.message(exc, "warning")
+            continue
+        raw_mode = value.lower().startswith("raw:")
+        if raw_mode:
+            value = value[4:].strip()
+        try:
+            raw = field.parse(value, words, args.model, raw_mode, args.flow_mode)
+            validate_change(field, raw, words)
+        except ToolError as exc:
+            ui.message("INPUT: " + str(exc), "error")
+            continue
+        try:
+            changed = edit_setting(client, journal, field, value, args.model, raw_mode,
+                                   confirm=ask, out=ui.message, before=words, ui=ui)
+            if changed:
+                ui.message("Setting saved and verified.", "good")
+        except (ToolError, OSError) as exc:
+            ui.box("CHANGE NOT COMPLETED", [(str(exc), "error")], "error")
+        ask("Enter to return to settings: ")
+        return
+
+
+def settings_editor(client, journal, args, ui, ask=input):
+    page = 0
+    page_size = max(4, min(10, (ui.height - 12) // (2 if ui.width < 60 else 1)))
+    pages = (len(SELECTABLE) + page_size - 1) // page_size
+    while True:
+        ui.clear()
+        ui.banner(client, "SETTINGS & EDIT  /  PAGE {} OF {}".format(page + 1, pages))
+        try:
+            words = read_config(client)
+            show_settings(words, args.model, ui=ui, mode=args.flow_mode,
+                          start=page * page_size, page_size=page_size, interactive=True)
+            choice = ask("Select setting > ").strip()
+            if not choice or choice.lower() in ("b", "q"):
+                return
+            if choice.lower() in ("n", "p"):
+                page = (page + (1 if choice.lower() == "n" else -1)) % pages
+            elif choice.lower() == "m":
+                choose_model(args, ui, ask)
+            elif choice.lower() != "r":
+                field = (SELECTABLE[int(choice) - 1] if choice.isdigit()
+                         and 1 <= int(choice) <= len(SELECTABLE) else find_field(choice))
+                edit_form(client, journal, field, args, ui, ask)
+        except (ToolError, OSError, argparse.ArgumentTypeError) as exc:
+            ui.box("SETTINGS ERROR", [(str(exc), "error")], "error")
+            if ask("Enter to retry, or b to return to dashboard: ").strip().lower() == "b":
+                return
+
+
+def menu(client, journal, args, ui=None):
+    ui = ui or Terminal()
     while True:
         try:
+            ui.clear()
             try:
-                show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode)
+                show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui=ui, brief=True)
             except ToolError as exc:
-                print("\nREAD FAILED - no current reading: {}".format(exc))
-            print("\n[w] Live readings  [s] Settings  [e] Edit  [b] Save snapshot")
-            print("[m] Select size variant  [r/Enter] Refresh  [q] Quit")
-            choice = input("> ").strip().lower()
+                ui.banner(client, "CONNECTION ERROR")
+                ui.box("NO CURRENT READING", [(str(exc), "error")], "error")
+            ui.box("ACTIONS", [
+                ("[S] Settings & edit  [W] Live  [B] Snapshot  [M] Size  [Enter] Refresh  [Q] Quit", "accent")])
+            choice = input("Dashboard > ").strip().lower()
             if choice == "q":
                 return
             if choice == "w":
-                watch(client, args.interval, mode=args.flow_mode)
-            elif choice == "s":
-                show_settings(read_config(client), args.model)
-                input("Enter to return: ")
+                watch(client, args.interval, mode=args.flow_mode, ui=ui)
+            elif choice in ("s", "e"):
+                settings_editor(client, journal, args, ui)
             elif choice == "b":
-                print("Saved " + str(journal.snapshot(read_config(client), args.model)))
+                ui.message("Saved " + str(journal.snapshot(read_config(client), args.model)), "good")
+                input("Enter to return: ")
             elif choice == "m":
-                print("Available variants (also covers L versions): " + ", ".join(PIPE_SIZES))
-                value = input("Variant, or Enter to cancel: ").strip()
-                if value:
-                    args.model = model_name(value)
-            elif choice == "e":
-                words = read_config(client)
-                show_settings(words, args.model)
-                key = input("Setting name or manual address (Enter cancels): ").strip()
-                if not key:
-                    continue
-                field = find_field(key)
-                if not field.writable:
-                    raise ToolError("{} is read-only.".format(field.title))
-                print("{}: {}".format(field.title, field.display(words, args.model)))
-                options = field.enum(args.model)
-                if options:
-                    print("Choices: " + "; ".join("{}={}".format(k, v) for k, v in options.items()))
-                if field.note:
-                    print(field.note)
-                if options is None and field.address != 196:
-                    scale, unit = field.measure(words)
-                    print("Enter {} to {} {}; step {}. Prefix raw: to enter a register integer.".format(
-                        Decimal(field.minimum) * scale, Decimal(field.maximum) * scale, unit, scale))
-                value = input("New value (Enter cancels): ").strip()
-                if value:
-                    raw_mode = value.lower().startswith("raw:")
-                    if raw_mode:
-                        value = value[4:].strip()
-                    edit_setting(client, journal, field, value, args.model, raw_mode)
+                choose_model(args, ui)
             elif choice not in ("", "r"):
-                print("Choose one of the listed commands.")
+                ui.message("Choose one of the listed commands.", "warning")
+                input("Enter to return: ")
         except (ToolError, OSError, argparse.ArgumentTypeError) as exc:
-            print("ERROR: {}".format(exc))
+            ui.message("ERROR: {}".format(exc), "error")
+            input("Enter to return: ")
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             return
@@ -635,6 +982,9 @@ def build_parser():
     parser.add_argument("--flow-mode", choices=["resolution", "integer"], default="resolution",
                         help="resolution = raw x register 25/26; integer = unscaled (see README)")
     parser.add_argument("--interval", type=positive_interval, default=1.0, help="Live polling interval in seconds")
+    parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                        help="Terminal colors (auto respects NO_COLOR)")
+    parser.add_argument("--ascii", action="store_true", help="Use ASCII borders instead of Unicode")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("menu", help="Interactive SSH terminal menu (default)")
     sub.add_parser("status", help="Read flow and statuses once")
@@ -646,7 +996,7 @@ def build_parser():
     live.add_argument("--csv", help="Write readings to a new CSV file")
     change = sub.add_parser("set", help="Preview, confirm, write and verify one setting")
     change.add_argument("field", help="Setting name or zero-based manual address")
-    change.add_argument("value", help="Code/label or engineering value; zero_cut uses raw counts")
+    change.add_argument("value", help="Code/label or value in the displayed engineering unit")
     change.add_argument("--raw", action="store_true", help="Interpret numeric input as raw integer")
     return parser
 
@@ -659,8 +1009,9 @@ def main(argv=None):
     if args.command == "watch" and args.count is not None and args.count < 1:
         parser.error("--count must be at least 1.")
     try:
+        ui = Terminal(color=args.color, ascii_only=args.ascii)
         if args.command == "catalog":
-            show_settings(model=args.model)
+            show_settings(model=args.model, ui=ui)
             for field in FIELDS:
                 options = field.enum(args.model)
                 if options:
@@ -669,20 +1020,33 @@ def main(argv=None):
                     print("{}: {}".format(field.key, field.note))
             return 0
         client = Demo() if args.demo else Modpoll(args.host, args.port, args.unit_id, args.modpoll, args.timeout)
-        journal = Journal(args.log_dir, client)
+        journal = Journal(args.log_dir, client, args.flow_mode)
         command = args.command or "menu"
         if command == "menu":
-            menu(client, journal, args)
+            menu(client, journal, args, ui)
         elif command == "status":
-            show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode)
+            show_status(client, read_ranges(client, STATUS_RANGES), args.flow_mode, ui=ui)
         elif command == "settings":
-            show_settings(read_config(client), args.model)
+            ui.banner(client, "SETTINGS")
+            show_settings(read_config(client), args.model, ui=ui, mode=args.flow_mode)
         elif command == "watch":
-            watch(client, args.interval, args.count, args.csv, args.flow_mode)
+            watch(client, args.interval, args.count, args.csv, args.flow_mode, ui)
         elif command == "snapshot":
             print(journal.snapshot(read_config(client), args.model))
         elif command == "set":
-            edit_setting(client, journal, find_field(args.field), args.value, args.model, args.raw)
+            field = find_field(args.field)
+            if not field.writable:
+                raise ToolError("Registers {} are read-only; they are displayed only.".format(field.registers))
+            words = read_config(client)
+            ui.banner(client, "EDIT SETTING")
+            if not args.raw:
+                # The form and CLI show the same unit/precision instructions.
+                try:
+                    show_input_help(field, words, args.model, args.flow_mode, ui)
+                except ToolError:
+                    pass  # parse() supplies the actionable validation error below.
+            edit_setting(client, journal, field, args.value, args.model, args.raw,
+                         before=words, ui=ui, out=ui.message)
         return 0
     except (ToolError, OSError) as exc:
         print("ERROR: {}".format(exc), file=sys.stderr)

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -104,7 +105,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(fdg.i32(self.client.read(4, 2), 4), -18524)
 
     def test_zero_cut_pair_is_one_write_low_word_first(self):
-        self.assertTrue(self.edit("101", "123456"))
+        self.assertTrue(self.edit("101", "123456", raw_mode=True))
         self.assertEqual(self.fake.writes, [(101, [57920, 1])])
         write_command = [args for args in self.fake.calls if args[-1] == "1" and "57920" in args][0]
         self.assertEqual(write_command[write_command.index("-r") + 1], "102")
@@ -256,6 +257,137 @@ class ToolTests(unittest.TestCase):
     def test_python_39_grammar(self):
         source = Path(fdg.__file__).read_text(encoding="utf-8")
         ast.parse(source, feature_version=(3, 9))
+
+    def ui(self, width=80, height=30):
+        return fdg.Terminal(color="never", ascii_only=True, width=width, height=height,
+                            interactive=False, out=self.messages.append)
+
+    def editor(self, answers, width=80):
+        replies = iter(answers)
+        prompts = []
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(replies)
+        args = SimpleNamespace(model=None, flow_mode="resolution")
+        fdg.settings_editor(self.client, self.journal, args, self.ui(width), ask)
+        return args, prompts
+
+    def test_settings_screen_edits_pressure_directly_with_decimal_help(self):
+        self.fake.words.update({208: 2, 201: 11000})
+        _, prompts = self.editor(["19", "110.25", "APPLY", "", ""])
+        self.assertEqual(self.fake.writes, [(201, [11025])])
+        text = "\n".join(self.messages)
+        self.assertIn("Type a setting #", text)
+        self.assertIn("Enter the value in psi", text)
+        self.assertIn("Decimals: up to 2", text)
+        self.assertIn("Example input: 110.00", text)
+        self.assertIn("110.25 psi", text)
+        self.assertIn("REVIEW CHANGE", text)
+        self.assertIn("Select setting > ", prompts)
+
+    def test_input_error_stays_in_form_and_accepts_corrected_value(self):
+        self.editor(["8", "60.301", "60.31", "APPLY", "", ""])
+        self.assertEqual(self.fake.writes, [(108, [6031])])
+        self.assertTrue(any("up to 2 decimal" in line for line in self.messages))
+
+    def test_enum_selection_in_settings_needs_no_separate_edit_menu(self):
+        self.editor(["1", "2", "APPLY", "", ""])
+        self.assertEqual(self.fake.writes, [(199, [2])])
+        self.assertTrue(any("CFM" in line for line in self.messages))
+
+    def test_settings_accepts_displayed_names_and_addresses(self):
+        self.assertEqual(fdg.find_field("Flow unit").address, 199)
+        self.assertEqual(fdg.find_field("Pipe wall thickness").address, 109)
+        self.assertEqual(fdg.find_field("Reference temperature").address, 116)
+        self.editor(["Flow unit", "CFM", "APPLY", "", ""])
+        self.assertEqual(self.fake.writes, [(199, [2])])
+
+    def test_readonly_value_and_cancelled_form_do_not_write(self):
+        self.editor(["25", "", "8", "", ""])
+        self.assertFalse(self.fake.writes)
+        self.assertFalse(self.directory.exists())
+
+    def test_pagination_and_refresh_are_read_only(self):
+        self.editor(["n", "p", "r", ""])
+        self.assertFalse(self.fake.writes)
+        text = "\n".join(self.messages)
+        self.assertIn("PAGE 2", text)
+        self.assertIn("[Enter/b] Dashboard", text)
+
+    def test_pipe_size_edit_opens_variant_selector_when_needed(self):
+        args, _ = self.editor(["10", "2", "2", "APPLY", "", ""])
+        self.assertEqual(args.model, "FD-G50")
+        self.assertEqual(self.fake.writes, [(196, [2])])
+
+    def test_precision_examples_follow_units_and_dynamic_resolution(self):
+        words = self.fake.words
+        for address, decimals, example, encoded in [
+                (108, 2, "60.30", 6030), (109, 2, "3.92", 392),
+                (111, 3, "1.403", 1403), (112, 2, "28.97", 2897),
+                (113, 3, "1.000", 1000), (116, 1, "20.0", 200)]:
+            with self.subTest(address=address):
+                spec = fdg.input_spec(fdg.BY_ADDRESS[address], words)
+                self.assertEqual((spec["decimals"], spec["example"], spec["raw_example"]),
+                                 (decimals, example, encoded))
+        words[208], words[209] = 2, 1
+        spec = fdg.input_spec(fdg.BY_ADDRESS[201], words)
+        self.assertEqual((spec["unit"], spec["example"], spec["maximum"]), ("psi", "110.00", "600.00"))
+        self.assertEqual(fdg.input_spec(fdg.BY_ADDRESS[116], words)["example"], "68.0")
+
+    def test_zero_cut_engineering_input_and_explicit_raw_input(self):
+        self.fake.words[25] = 2  # Current meter resolution 0.1
+        self.assertTrue(self.edit("zero_cut", "2.5"))
+        self.assertEqual(self.fake.writes, [(101, [25, 0])])
+        with self.assertRaises(fdg.ToolError):
+            fdg.BY_KEY["zero_cut"].parse("2.55", self.fake.words)
+        self.assertEqual(fdg.BY_KEY["zero_cut"].parse("2.5", self.fake.words, flow_mode="resolution"), 25)
+        self.assertEqual(fdg.BY_KEY["zero_cut"].parse("25", self.fake.words, flow_mode="integer"), 25)
+        self.assertEqual(fdg.BY_KEY["zero_cut"].parse("25", self.fake.words, raw_mode=True), 25)
+
+    def test_unit_change_while_form_is_open_is_rejected(self):
+        self.fake.words.update({208: 2, 201: 11000})
+        replies = iter(["111.00", "APPLY", ""])
+        def ask(prompt):
+            answer = next(replies)
+            if prompt.startswith("New value"):
+                self.fake.words[208] = 0
+            return answer
+        fdg.edit_form(self.client, self.journal, fdg.BY_KEY["pipe_pressure"],
+                      SimpleNamespace(model=None, flow_mode="resolution"), self.ui(), ask)
+        self.assertFalse(self.fake.writes)
+        self.assertTrue(any("changed since" in text for text in self.messages))
+
+    def test_layout_fits_narrow_and_standard_ssh_terminals_without_ansi(self):
+        for width in (40, 60, 80, 120):
+            with self.subTest(width=width):
+                self.messages.clear()
+                ui = self.ui(width)
+                fdg.show_status(self.client, self.fake.words, ui=ui)
+                fdg.show_settings(self.fake.words, ui=ui, interactive=True, page_size=5)
+                fdg.show_input_help(fdg.BY_KEY["pipe_od"], self.fake.words, None, "resolution", ui)
+                self.assertTrue(all(len(line) <= width for line in self.messages),
+                                [(len(line), line) for line in self.messages if len(line) > width])
+                self.assertFalse(any("\033[" in line for line in self.messages))
+
+    def test_color_auto_respects_no_color_and_explicit_setting(self):
+        with patch.dict("os.environ", {"NO_COLOR": "1"}):
+            self.assertFalse(fdg.Terminal(color="auto", interactive=True).color)
+            self.assertTrue(fdg.Terminal(color="always", interactive=False).color)
+        self.assertFalse(fdg.Terminal(color="never", interactive=True).color)
+
+    def test_live_terminal_restores_cursor_after_failed_read(self):
+        self.fake.output_override = "Reply time-out!"
+        ui = fdg.Terminal(color="never", ascii_only=True, interactive=True,
+                          width=80, out=self.messages.append)
+        fdg.watch(self.client, count=1, ui=ui)
+        self.assertIn("\033[?25l", self.messages)
+        self.assertEqual(self.messages[-1], "\033[?25h")
+        self.assertTrue(any("NO CURRENT READING" in line for line in self.messages))
+        self.assertFalse(any("-185.24" in line for line in self.messages))
+
+    def test_live_trend_includes_recent_flow_and_keeps_csv_decoding(self):
+        self.assertEqual(len(fdg.sparkline([fdg.Decimal(1)] * 100, 20, False)), 20)
+        self.assertEqual(fdg.sparkline([fdg.Decimal(0), fdg.Decimal(10)], 10, False), ".@")
 
 
 if __name__ == "__main__":
